@@ -23,6 +23,12 @@ constexpr uint8_t L_id = 0x7e;
 constexpr uint8_t R_id = 0x7f;
 constexpr uint32_t baudrate = 460800;
 
+// DDS array order: [thumb, thumb_aux, index, middle, ring, pinky]
+const StarkFingerId kFingerIds[6] = {
+    STARK_FINGER_ID_THUMB, STARK_FINGER_ID_THUMB_AUX, STARK_FINGER_ID_INDEX,
+    STARK_FINGER_ID_MIDDLE, STARK_FINGER_ID_RING, STARK_FINGER_ID_PINKY,
+};
+
 // ------------------ Utility ------------------
 std::vector<std::string> getAvailableSerialPorts() {
     std::vector<std::string> ports;
@@ -100,15 +106,34 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
                    const std::string& ns) {
-    uint16_t positions[6], speeds[6];
+    // Hybrid position/current control. Position+speed alone can't tell "stalled
+    // against an object" from "stalled against its own end-stop" -- both max
+    // out current identically. Below kGripThreshold we still track
+    // position+speed as before: smooth, safe open/approach motion. At/above it
+    // (a firm close/grip command) we switch that finger to direct current
+    // control instead: current mode is inherently compliant, so the finger
+    // closes until it meets real resistance (object or hard-stop) and holds
+    // there at exactly the commanded current, rather than slamming a position
+    // target and letting the servo's stall behavior decide the force.
+    // Per-finger, not a whole-hand mode switch, so a partial grip (e.g. index
+    // held open while the rest close) still works in one tick.
+    constexpr uint16_t kGripThreshold = 500;  // normalized position (0-1000)
+    constexpr int16_t kGripCurrent = 800;    // normalized current (0-1000); tune from testing
 
+    uint16_t positions[6], speeds[6];
     for (int i = 0; i < 6; ++i) {
         positions[i] = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].q(), 0.f, 1.f) * 1000.f);
         speeds[i]    = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].dq(), 0.f, 1.f) * 1000.f);
     }
 
-    // Write commands
-    stark_set_finger_positions_and_speeds(handle, slave_id, positions, speeds, 6);
+    for (int i = 0; i < 6; ++i) {
+        if (positions[i] >= kGripThreshold) {
+            stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
+        } else {
+            uint16_t speed = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
+            stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speed);
+        }
+    }
 
     // Read status
     auto status = stark_get_motor_status(handle, slave_id);
