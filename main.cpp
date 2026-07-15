@@ -108,16 +108,26 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
                    const std::string& ns) {
     // Hybrid position/current control. Position+speed alone can't tell "stalled
     // against an object" from "stalled against its own end-stop" -- both max
-    // out current identically. Below kGripThreshold we still track
-    // position+speed as before: smooth, safe open/approach motion. At/above it
-    // (a firm close/grip command) we switch that finger to direct current
-    // control instead: current mode is inherently compliant, so the finger
-    // closes until it meets real resistance (object or hard-stop) and holds
-    // there at exactly the commanded current, rather than slamming a position
-    // target and letting the servo's stall behavior decide the force.
-    // Per-finger, not a whole-hand mode switch, so a partial grip (e.g. index
-    // held open while the rest close) still works in one tick.
-    constexpr uint16_t kGripThreshold = 500;  // normalized position (0-1000)
+    // out current identically. Below kGripThreshold we track position+speed:
+    // smooth, safe open/approach *and* positioning motion. At/above it (a firm
+    // close/grip command) we switch that finger to direct current control
+    // instead: current mode is inherently compliant, so the finger closes until
+    // it meets real resistance (object or hard-stop) and holds there at exactly
+    // the commanded current, rather than slamming a position target and letting
+    // the servo's stall behavior decide the force. Per-finger, not a whole-hand
+    // mode switch, so a partial grip (e.g. index held open while the rest close)
+    // still works in one tick.
+    //
+    // The threshold must sit ABOVE positioning-level commands and below real
+    // grips. In the pose catalogue every genuine grip is 0.9-0.98; the only
+    // positioning value in the mid-range is thumb_aux = 0.7 (the `claw` pose,
+    // and thumb_aux in `close`/`point`). An unopposed finger handed to the
+    // compliant current loop has nothing to react against, so it hunts around a
+    // friction stall and buzzes -- that was `claw`. At 800 the 0.7 positioning
+    // commands stay in position control (hold their target, no buzz) while
+    // 0.9-0.98 grips keep current-mode compliance.
+    constexpr uint16_t kGripThreshold = 800;  // normalized POSITION (0-1000); note the
+                                              // shared 800 below is the unrelated CURRENT scale
     constexpr int16_t kGripCurrent = 800;    // normalized current (0-1000); tune from testing
 
     uint16_t positions[6], speeds[6];
