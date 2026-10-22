@@ -12,6 +12,7 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <filesystem>
 
@@ -105,7 +106,7 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 void update_finger(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
-                   const std::string& ns) {
+                   const std::string& ns, std::array<bool, 6>& in_current) {
     // Hybrid position/current control. Position+speed alone can't tell "stalled
     // against an object" from "stalled against its own end-stop" -- both max
     // out current identically. Below kGripThreshold we track position+speed:
@@ -137,10 +138,14 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
 
     for (int i = 0; i < 6; ++i) {
         if (positions[i] >= kGripThreshold) {
-            stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
+            // Only on entry: each current write dips that finger's current for a few
+            // milliseconds, so rewriting it every tick makes a held grip buzz.
+            if (!in_current[i]) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
+            in_current[i] = true;
         } else {
             uint16_t speed = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
             stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speed);
+            in_current[i] = false;
         }
     }
 
@@ -173,9 +178,10 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
     auto lowstate = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/state");
     lowstate->msg_.states().resize(6);
 
+    std::array<bool, 6> in_current{};
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
-        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns);
+        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns, in_current);
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
         if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
