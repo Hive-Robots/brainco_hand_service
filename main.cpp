@@ -126,9 +126,8 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     // friction stall and buzzes -- that was `claw`. At 800 the 0.7 positioning
     // commands stay in position control (hold their target, no buzz) while
     // 0.9-0.98 grips keep current-mode compliance.
-    constexpr uint16_t kGripThreshold = 800;  // normalized POSITION (0-1000); note the
-                                              // shared 800 below is the unrelated CURRENT scale
-    constexpr int16_t kGripCurrent = 800;    // normalized current (0-1000); tune from testing
+    constexpr uint16_t kGripThreshold = 800;  // normalized POSITION (0-1000)
+    constexpr int16_t kGripCurrent = 600;    // normalized current (0-1000); tune from testing
 
     uint16_t positions[6], speeds[6];
     for (int i = 0; i < 6; ++i) {
