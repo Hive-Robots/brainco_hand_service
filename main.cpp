@@ -119,14 +119,11 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     // mode switch, so a partial grip (e.g. index held open while the rest close)
     // still works in one tick.
     //
-    // The threshold must sit ABOVE positioning-level commands and below real
-    // grips. In the pose catalogue every genuine grip is 0.9-0.98; the only
-    // positioning value in the mid-range is thumb_aux = 0.7 (the `claw` pose,
-    // and thumb_aux in `close`/`point`). An unopposed finger handed to the
-    // compliant current loop has nothing to react against, so it hunts around a
-    // friction stall and buzzes -- that was `claw`. At 800 the 0.7 positioning
-    // commands stay in position control (hold their target, no buzz) while
-    // 0.9-0.98 grips keep current-mode compliance.
+    // The threshold sits below real grips: in the pose catalogue every genuine grip
+    // is 0.9-0.98. thumb_aux never takes current mode, whatever its command: it
+    // swings the thumb sideways and has nothing to press against, so current mode
+    // drives it into its end stop, where the firmware cuts its current and leaves
+    // it limp.
     constexpr uint16_t kGripThreshold = 800;  // normalized POSITION (0-1000)
     constexpr int16_t kGripCurrent = 500;    // normalized current (0-1000); tune from testing
 
@@ -137,7 +134,7 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     }
 
     for (int i = 0; i < 6; ++i) {
-        if (positions[i] >= kGripThreshold) {
+        if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) {
             // Only on entry: each current write dips that finger's current for a few
             // milliseconds, so rewriting it every tick makes a held grip buzz.
             if (!in_current[i]) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
