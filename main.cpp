@@ -188,8 +188,10 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
 void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id,
                      unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
                      std::array<bool, 6>& released) {
-    // Closed, at the full-grasp caps the teleop controller commands.
-    constexpr uint16_t kRestPose[6] = {980, 700, 980, 980, 980, 980};
+    // Closed, at the full-grasp caps the teleop controller commands, except thumb_aux: the
+    // closing thumb and index stop it short of that cap and it is not released there, so its
+    // rest sits below where they block it.
+    constexpr uint16_t kRestPose[6] = {980, 300, 980, 980, 980, 980};
     constexpr uint16_t kRestSpeed = 1000;
     constexpr int kReachedTol = 20;  // normalized position (0-1000)
 
