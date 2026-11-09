@@ -133,16 +133,30 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
         speeds[i]    = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].dq(), 0.f, 1.f) * 1000.f);
     }
 
-    for (int i = 0; i < 6; ++i) {
-        if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) {
-            // Only on entry: each current write dips that finger's current for a few
-            // milliseconds, so rewriting it every tick makes a held grip buzz.
-            if (!in_current[i]) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
-            in_current[i] = true;
-        } else {
-            uint16_t speed = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
-            stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speed);
-            in_current[i] = false;
+    for (int i = 0; i < 6; ++i) speeds[i] = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
+
+    bool any_grip = false;
+    for (int i = 0; i < 6; ++i)
+        if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) any_grip = true;
+
+    if (!any_grip) {
+        // Every Modbus write is its own serial transaction, and six per-finger writes
+        // stretch the loop well past its 10 ms period. The batched write sets all six
+        // fingers, so it would knock a gripping finger out of current mode: only when
+        // none grips.
+        stark_set_finger_positions_and_speeds(handle, slave_id, positions, speeds, 6);
+        in_current.fill(false);
+    } else {
+        for (int i = 0; i < 6; ++i) {
+            if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) {
+                // Only on entry: each current write dips that finger's current for a few
+                // milliseconds, so rewriting it every tick makes a held grip buzz.
+                if (!in_current[i]) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
+                in_current[i] = true;
+            } else {
+                stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speeds[i]);
+                in_current[i] = false;
+            }
         }
     }
 
