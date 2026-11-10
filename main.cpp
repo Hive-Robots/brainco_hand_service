@@ -189,6 +189,10 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
 // uncommanded. A stalled finger is released where it stopped, since it can get no closer.
 // `timed_out` releases every finger still held: a finger blocked short of its pose can hold
 // it at its lock current without the firmware ever reporting a stall.
+// A rest on a finger gripping in current mode moves it to a position target, so a finger
+// blocked by the object pushes past kGripCurrent, up to the firmware's limit, until it stalls,
+// and then lets the object go. hive_fsm_ctrl never sends a rest to a hand whose command grips;
+// anyone driving this service or the hand directly has to keep to that too.
 void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id,
                      unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
                      std::array<bool, 6>& released, bool timed_out) {
