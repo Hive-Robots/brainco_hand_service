@@ -28,7 +28,7 @@ constexpr uint32_t baudrate = 460800;
 constexpr uint8_t kRestMode = 1;
 // How long a rest may hold a finger before releasing it wherever it is. Above the time the
 // close takes at kRestSpeed, so it releases only a finger that is blocked.
-constexpr auto kRestReleaseAfter = std::chrono::seconds(2);
+constexpr auto kRestReleaseAfter = std::chrono::seconds(5);
 
 // DDS array order: [thumb, thumb_aux, index, middle, ring, pinky]
 const StarkFingerId kFingerIds[6] = {
@@ -196,7 +196,9 @@ void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id,
     // closing thumb and index stop it short of that cap and it is not released there, so its
     // rest sits below where they block it.
     constexpr uint16_t kRestPose[6] = {980, 300, 980, 980, 980, 980};
-    constexpr uint16_t kRestSpeed = 1000;
+    // A third of full speed: the hand closes at every start, before any command, and may be
+    // closing on the hand of someone mounting or holding it.
+    constexpr uint16_t kRestSpeed = 300;
     constexpr int kReachedTol = 20;  // normalized position (0-1000)
 
     for (int i = 0; i < 6; ++i) {
