@@ -1,5 +1,6 @@
 #include "stark-sdk.h"
 #include "param.h"
+#include "drive.h"
 
 #include "dds/Publisher.h"
 #include "dds/Subscription.h"
@@ -106,56 +107,61 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 void update_finger(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
-                   const std::string& ns, std::array<bool, 6>& in_current) {
-    // Hybrid position/current control. Position+speed alone can't tell "stalled
-    // against an object" from "stalled against its own end-stop" -- both max
-    // out current identically. Below kGripThreshold we track position+speed:
-    // smooth, safe open/approach *and* positioning motion. At/above it (a firm
-    // close/grip command) we switch that finger to direct current control
-    // instead: current mode is inherently compliant, so the finger closes until
-    // it meets real resistance (object or hard-stop) and holds there at exactly
-    // the commanded current, rather than slamming a position target and letting
-    // the servo's stall behavior decide the force. Per-finger, not a whole-hand
-    // mode switch, so a partial grip (e.g. index held open while the rest close)
-    // still works in one tick.
-    //
-    // The threshold sits below real grips: in the pose catalogue every genuine grip
-    // is 0.9-0.98. thumb_aux never takes current mode, whatever its command: it
-    // swings the thumb sideways and has nothing to press against, so current mode
-    // drives it into its end stop, where the firmware cuts its current and leaves
-    // it limp.
-    constexpr uint16_t kGripThreshold = 800;  // normalized POSITION (0-1000)
-    constexpr int16_t kGripCurrent = 500;    // normalized current (0-1000); tune from testing
-
+                   const std::string& ns, std::array<drive::Finger, 6>& fingers) {
+    // Per finger, one of three drives, chosen in drive.h. Position+speed alone can't tell
+    // "stalled against an object" from "stalled against its own end-stop" -- both max out
+    // current identically. Below the grip threshold a finger tracks position+speed: smooth,
+    // safe open/approach *and* positioning motion. At/above it (a firm close/grip command)
+    // it switches to direct current control instead: current mode is inherently compliant,
+    // so the finger closes until it meets real resistance (object or hard-stop) and holds
+    // there at exactly the commanded current, rather than slamming a position target and
+    // letting the servo's stall behavior decide the force. Per-finger, not a whole-hand mode
+    // switch, so a partial grip (e.g. index held open while the rest close) still works in
+    // one tick. A finger whose command says it has arrived (mode kOffMode) has its drive
+    // switched off: PWM 0 draws nothing and the gear train holds it. thumb_aux never takes
+    // current mode and is never switched off, whatever its command: it swings the thumb
+    // sideways with nothing to press against, so current mode drives it into its end stop,
+    // where the firmware cuts its current and leaves it limp, and without power it has no
+    // hold at all.
     uint16_t positions[6], speeds[6];
+    uint8_t modes[6];
     for (int i = 0; i < 6; ++i) {
         positions[i] = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].q(), 0.f, 1.f) * 1000.f);
         speeds[i]    = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].dq(), 0.f, 1.f) * 1000.f);
+        modes[i]     = lowcmd->msg_.cmds()[i].mode();
     }
 
     for (int i = 0; i < 6; ++i) speeds[i] = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
 
-    bool any_grip = false;
-    for (int i = 0; i < 6; ++i)
-        if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) any_grip = true;
+    std::array<drive::Write, 6> writes;
+    bool all_positioned = true;
+    for (int i = 0; i < 6; ++i) {
+        const bool was_off = fingers[i].off;
+        writes[i] = drive::choose(fingers[i], positions[i], modes[i], kFingerIds[i] == STARK_FINGER_ID_THUMB_AUX);
+        if (fingers[i].in_current || fingers[i].off) all_positioned = false;
+        if (fingers[i].off != was_off) spdlog::info("{} finger {}: drive {}", ns, i, fingers[i].off ? "off" : "on");
+    }
 
-    if (!any_grip) {
+    if (all_positioned) {
         // Every Modbus write is its own serial transaction, and six per-finger writes
         // stretch the loop well past its 10 ms period. The batched write sets all six
-        // fingers, so it would knock a gripping finger out of current mode: only when
-        // none grips.
+        // fingers, so it would knock a gripping finger out of current mode and re-energise
+        // a finger that is off: only when every finger is positioned.
         stark_set_finger_positions_and_speeds(handle, slave_id, positions, speeds, 6);
-        in_current.fill(false);
     } else {
         for (int i = 0; i < 6; ++i) {
-            if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) {
-                // Only on entry: each current write dips that finger's current for a few
-                // milliseconds, so rewriting it every tick makes a held grip buzz.
-                if (!in_current[i]) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
-                in_current[i] = true;
-            } else {
-                stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speeds[i]);
-                in_current[i] = false;
+            switch (writes[i]) {
+                case drive::Write::kPosition:
+                    stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speeds[i]);
+                    break;
+                case drive::Write::kCurrent:
+                    stark_set_finger_current(handle, slave_id, kFingerIds[i], drive::kGripCurrent);
+                    break;
+                case drive::Write::kPwmOff:
+                    stark_set_finger_pwm(handle, slave_id, kFingerIds[i], 0);
+                    break;
+                case drive::Write::kNone:
+                    break;
             }
         }
     }
@@ -168,6 +174,7 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
         lowstate->msg_.states()[i].q()        = status->positions[i] / 1000.f;
         lowstate->msg_.states()[i].dq()       = status->speeds[i] / 1000.f;
         lowstate->msg_.states()[i].tau_est()  = status->currents[i] / 1000.f;
+        lowstate->msg_.states()[i].mode()     = fingers[i].off ? drive::kParkedState : 0;
 
         // if (status->currents[i] > 800) {
         //     spdlog::warn("{} finger {} over current: {} mA", ns, i, status->currents[i]);
@@ -189,10 +196,10 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
     auto lowstate = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/state");
     lowstate->msg_.states().resize(6);
 
-    std::array<bool, 6> in_current{};
+    std::array<drive::Finger, 6> fingers{};
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
-        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns, in_current);
+        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns, fingers);
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
         if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));

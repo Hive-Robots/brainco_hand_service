@@ -50,3 +50,4 @@ link_libraries(
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 add_executable(brainco_hand_server main.cpp)
 add_executable(test_brainco_hand_server test/test_brainco_hand_server.cpp)
+add_executable(test_drive test/test_drive.cpp)
