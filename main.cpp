@@ -35,9 +35,8 @@ const StarkFingerId kFingerIds[6] = {
 // the serial line the motor writes and reads share, so it slows the motor loop.
 constexpr int kTouchEvery = 2;
 constexpr uint8_t kAllFingertips = 0x1F;  // thumb, index, middle, ring, pinky
-// The raw channels (47 words) are the costlier read, so less often, on loops the fused
-// reading skips.
-constexpr int kRawEvery = 4;
+// The hand's touch protocol says a calibrated fingertip's readings are invalid for this long.
+constexpr auto kTouchSettle = std::chrono::seconds(2);
 // A requested grip current is re-written only when it moved this much: each write dips the
 // finger's current for a few milliseconds.
 constexpr int16_t kCurrentStep = 10;
@@ -239,31 +238,6 @@ void publish_touch(DeviceHandler* handle, uint8_t slave_id,
     free_touch_finger_data(data);
 }
 
-// The fingertip sensors' raw channels, as the SDK lays them out: thumb 7, index 11, middle 11,
-// ring 11, pinky 7, one MotorState_ entry each with the count in lost: uint32 like the count,
-// where q's float32 would round counts above 2^24. Which channels a Revo2 actually fills is for
-// the readings to show.
-constexpr int kRawChannels = 47;
-void publish_touch_raw(DeviceHandler* handle, uint8_t slave_id,
-                       unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* raw,
-                       const std::string& ns, int& failures) {
-    CTouchRawData* data = stark_get_touch_raw_data(handle, slave_id);
-    if (!data) {
-        if (failures++ % 100 == 0) spdlog::warn("{} fingertip raw read failed ({} so far)", ns, failures);
-        return;
-    }
-    if (raw->trylock()) {
-        int k = 0;
-        for (uint32_t v : data->thumb) raw->msg_.states()[k++].lost() = v;
-        for (uint32_t v : data->index) raw->msg_.states()[k++].lost() = v;
-        for (uint32_t v : data->middle) raw->msg_.states()[k++].lost() = v;
-        for (uint32_t v : data->ring) raw->msg_.states()[k++].lost() = v;
-        for (uint32_t v : data->pinky) raw->msg_.states()[k++].lost() = v;
-        raw->unlockAndPublish();
-    }
-    free_touch_raw_data(data);
-}
-
 // Worker thread for each hand
 void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns, bool has_touch) {
     spdlog::info("🚀 Starting worker for {} (slave {})", ns, (int)slave_id);
@@ -279,24 +253,32 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns,
     auto grip = std::make_shared<unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>>("rt/brainco/" + ns + "/grip_current");
     grip->set_timeout_ms(1000);
 
-    std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> touch, raw;
+    // No raw channels: the SDK's raw read assumes Revo1's layout, and on a Revo2 its Rust code
+    // panics, which aborts this whole process.
+    std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> touch;
+    auto touch_from = std::chrono::steady_clock::now();
     if (has_touch) {
         stark_enable_touch_sensor(handle, slave_id, kAllFingertips);
+        // Enabled alone, a fingertip can come up flagged and never move: a raw value stuck
+        // (status bit 1, cleared by a reset) or an idle force offset held past 10 s (bit 2, its
+        // force frozen until calibrated). Both zero against an unloaded fingertip, so the
+        // service must start with nothing touching them.
+        stark_reset_touch_sensor(handle, slave_id, kAllFingertips);
+        stark_calibrate_touch_sensor(handle, slave_id, kAllFingertips);
+        touch_from += kTouchSettle;
         touch = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/touch");
         touch->msg_.states().resize(5);
-        raw = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/touch_raw");
-        raw->msg_.states().resize(kRawChannels);
-        spdlog::info("{} fingertip sensors on, published every {} loops, raw every {}", ns, kTouchEvery, kRawEvery);
+        spdlog::info("{} fingertip sensors on, reset and calibrated, published every {} loops", ns, kTouchEvery);
     }
 
     std::array<drive::Finger, 6> fingers{};
-    int loops = 0, touch_failures = 0, raw_failures = 0;
+    int loops = 0, touch_failures = 0;
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
         update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), grip.get(), ns, fingers);
         ++loops;
-        if (touch && loops % kTouchEvery == 0) publish_touch(handle, slave_id, touch.get(), ns, touch_failures);
-        if (raw && loops % kRawEvery == 1) publish_touch_raw(handle, slave_id, raw.get(), ns, raw_failures);
+        if (touch && loops % kTouchEvery == 0 && std::chrono::steady_clock::now() >= touch_from)
+            publish_touch(handle, slave_id, touch.get(), ns, touch_failures);
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
         if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
