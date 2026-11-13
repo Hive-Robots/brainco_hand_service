@@ -88,6 +88,13 @@ HandConnection try_connect_hand(const std::string& port, uint8_t slave_id) {
     return ret;
 }
 
+// thumb_aux is blocked short of a grip's command by the closing thumb, and the firmware
+// then holds it at its lock current alone: at the 200 mA default a held object pushes the
+// thumb sideways. The raised value (the firmware's max) is set only while a finger grips,
+// so the motor does not sit at it when nothing is held.
+constexpr uint16_t kThumbAuxLockCurrentRest = 200;  // mA, the firmware default
+constexpr uint16_t kThumbAuxLockCurrentGrip = 500;  // mA
+
 // Find a hand from available ports given allowed SKUs
 HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, const std::vector<SkuType>& allowed_skus, const std::string& hand_name) {
     for (const auto& port : ports) {
@@ -97,6 +104,10 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 
         if (std::find(allowed_skus.begin(), allowed_skus.end(), conn.info->sku_type) != allowed_skus.end()) {
             spdlog::info("{} hand bound to {} port", hand_name, port);
+            // Start from the default: a value an earlier run raised may still be set.
+            stark_set_thumb_aux_lock_current(conn.handle, slave_id, kThumbAuxLockCurrentRest);
+            spdlog::info("{} thumb_aux lock current: {} mA", hand_name,
+                         stark_get_thumb_aux_lock_current(conn.handle, slave_id));
             ports.erase(std::remove(ports.begin(), ports.end(), port), ports.end());
             return conn;
         } else {
@@ -119,7 +130,8 @@ void publish_status(const CMotorStatusData* status,
     lowstate->unlockAndPublish();
 }
 
-void update_finger(DeviceHandler* handle, uint8_t slave_id,
+// Returns whether any finger grips, i.e. is in current mode.
+bool update_finger(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
                    std::array<bool, 6>& in_current) {
@@ -177,9 +189,11 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     }
 
     auto status = stark_get_motor_status(handle, slave_id);
-    if (!status) return;
-    publish_status(status, lowstate);
-    free_motor_status_data(status);
+    if (status) {
+        publish_status(status, lowstate);
+        free_motor_status_data(status);
+    }
+    return any_grip;
 }
 
 // The pose a hand rests in until its first command, and whenever the FSM sends a rest
@@ -235,6 +249,7 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
 
     std::array<bool, 6> in_current{};
     std::array<bool, 6> released{};
+    bool aux_lock_raised = false;
     // Latched: once commanded, a stream that goes quiet leaves the hand at its last command,
     // so a dead FSM or multiplexer never drops what a hand carries.
     bool commanded = false;
@@ -249,13 +264,20 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
             if (resting) rest_since = std::chrono::steady_clock::now();
             spdlog::info("{} hand {}", ns, resting ? "closing to rest" : "following commands");
         }
+        bool grip = false;
         if (rest) {
             const bool timed_out = std::chrono::steady_clock::now() - rest_since >= kRestReleaseAfter;
             hold_rest_pose(handle, slave_id, lowstate.get(), released, timed_out);
             in_current.fill(false);
         } else {
-            update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), in_current);
+            grip = update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), in_current);
             released.fill(false);
+        }
+        // Written only on a change: each write is its own Modbus transaction.
+        if (grip != aux_lock_raised) {
+            stark_set_thumb_aux_lock_current(handle, slave_id,
+                                             grip ? kThumbAuxLockCurrentGrip : kThumbAuxLockCurrentRest);
+            aux_lock_raised = grip;
         }
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
