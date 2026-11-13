@@ -25,6 +25,7 @@ The dexterous hand is controlled via serial communication, and the manufacturer 
 In this repository, we convert serial messages into DDS messages so they can be used with [unitree_sdk2](https://github.com/unitreerobotics/unitree_sdk2) or [unitree_sdk2_python](https://github.com/unitreerobotics/unitree_sdk2_python).
 
 - Each hand (left or right) is controlled by a USB-to-serial device, and each generates a pair of topics: `rt/brainco/(left or right)/(cmd or state)`.
+- A Revo2 Touch hand also publishes its five fingertip sensors (thumb to pinky) on `rt/brainco/(left or right)/touch`, as `MotorStates_` with five entries: `q` normal force (N), `dq` tangential force (N), `ddq` its direction (degrees, 0 toward the fingertip, -1 with none), `tau_est` proximity (raw), `mode` the sensor status (low byte). Read every second loop, since each read shares the serial line with the motors.
 
 - The position and speed of the fingers are normalized to the [0, 1] range.
 

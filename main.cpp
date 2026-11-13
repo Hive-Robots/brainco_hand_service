@@ -31,6 +31,11 @@ const StarkFingerId kFingerIds[6] = {
     STARK_FINGER_ID_MIDDLE, STARK_FINGER_ID_RING, STARK_FINGER_ID_PINKY,
 };
 
+// Fingertip sensors are read every this many loops: each read is one more Modbus transaction on
+// the serial line the motor writes and reads share, so it slows the motor loop.
+constexpr int kTouchEvery = 2;
+constexpr uint8_t kAllFingertips = 0x1F;  // thumb, index, middle, ring, pinky
+
 // ------------------ Utility ------------------
 std::vector<std::string> getAvailableSerialPorts() {
     std::vector<std::string> ports;
@@ -184,8 +189,36 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     free_motor_status_data(status);
 }
 
+// Revo2 Touch: one capacitive sensor per fingertip, thumb to pinky, published as five MotorState_
+// entries so every reader that decodes the hand's state decodes these too: q the normal force (N),
+// dq the tangential force (N), ddq its direction (degrees, 0 toward the tip, -1 with none),
+// tau_est the proximity (raw counts), mode the sensor status (its low byte). Revo2 fills only the
+// first of the SDK's three channels per field.
+void publish_touch(DeviceHandler* handle, uint8_t slave_id,
+                   unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* touch,
+                   const std::string& ns, int& failures) {
+    CTouchFingerData* data = stark_get_touch_status(handle, slave_id);
+    if (!data) {
+        if (failures++ % 100 == 0) spdlog::warn("{} fingertip read failed ({} so far)", ns, failures);
+        return;
+    }
+    if (touch->trylock()) {
+        for (int i = 0; i < 5; ++i) {
+            const CTouchFingerItem& f = data->items[i];
+            auto& s = touch->msg_.states()[i];
+            s.q()       = f.normal_force1 / 100.f;
+            s.dq()      = f.tangential_force1 / 100.f;
+            s.ddq()     = f.tangential_direction1 == 0xFFFF ? -1.f : static_cast<float>(f.tangential_direction1);
+            s.tau_est() = static_cast<float>(f.self_proximity1);
+            s.mode()    = static_cast<uint8_t>(f.status & 0xFF);
+        }
+        touch->unlockAndPublish();
+    }
+    free_touch_finger_data(data);
+}
+
 // Worker thread for each hand
-void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns) {
+void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns, bool has_touch) {
     spdlog::info("🚀 Starting worker for {} (slave {})", ns, (int)slave_id);
 
     // DDS setup
@@ -196,10 +229,20 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
     auto lowstate = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/state");
     lowstate->msg_.states().resize(6);
 
+    std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> touch;
+    if (has_touch) {
+        stark_enable_touch_sensor(handle, slave_id, kAllFingertips);
+        touch = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/touch");
+        touch->msg_.states().resize(5);
+        spdlog::info("{} fingertip sensors on, published every {} loops", ns, kTouchEvery);
+    }
+
     std::array<drive::Finger, 6> fingers{};
+    int loops = 0, touch_failures = 0;
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
         update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns, fingers);
+        if (touch && ++loops % kTouchEvery == 0) publish_touch(handle, slave_id, touch.get(), ns, touch_failures);
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
         if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
@@ -227,8 +270,8 @@ int main(int argc, char** argv) {
     HandConnection right_conn = find_hand(available_ports, R_id, {SkuType::SKU_TYPE_SMALL_RIGHT, SkuType::SKU_TYPE_MEDIUM_RIGHT}, "right");
 
     std::thread left_thread, right_thread;
-    if (left_conn.handle)  left_thread  = std::thread(hand_worker, left_conn.handle, L_id, "left");
-    if (right_conn.handle) right_thread = std::thread(hand_worker, right_conn.handle, R_id, "right");
+    if (left_conn.handle)  left_thread  = std::thread(hand_worker, left_conn.handle, L_id, "left", stark_uses_revo2_touch_api(left_conn.info->hardware_type));
+    if (right_conn.handle) right_thread = std::thread(hand_worker, right_conn.handle, R_id, "right", stark_uses_revo2_touch_api(right_conn.info->hardware_type));
 
     if (left_thread.joinable())  left_thread.join();
     if (right_thread.joinable()) right_thread.join();
