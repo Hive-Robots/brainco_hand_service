@@ -12,6 +12,7 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <filesystem>
@@ -23,6 +24,11 @@ void signal_handler(int) { running = false; }
 constexpr uint8_t L_id = 0x7e;
 constexpr uint8_t R_id = 0x7f;
 constexpr uint32_t baudrate = 460800;
+// MotorCmd_.mode on a hand's commands asking it to close to rest with its drive off.
+constexpr uint8_t kRestMode = 1;
+// How long a rest may hold a finger before releasing it wherever it is. Above the time the
+// close takes at kRestSpeed, so it releases only a finger that is blocked.
+constexpr auto kRestReleaseAfter = std::chrono::seconds(5);
 
 // DDS array order: [thumb, thumb_aux, index, middle, ring, pinky]
 const StarkFingerId kFingerIds[6] = {
@@ -103,10 +109,20 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 }
 
 // ------------------ Hand Update Loop ------------------
+void publish_status(const CMotorStatusData* status,
+                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate) {
+    for (int i = 0; i < 6; ++i) {
+        lowstate->msg_.states()[i].q()        = status->positions[i] / 1000.f;
+        lowstate->msg_.states()[i].dq()       = status->speeds[i] / 1000.f;
+        lowstate->msg_.states()[i].tau_est()  = status->currents[i] / 1000.f;
+    }
+    lowstate->unlockAndPublish();
+}
+
 void update_finger(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
-                   const std::string& ns, std::array<bool, 6>& in_current) {
+                   std::array<bool, 6>& in_current) {
     // Hybrid position/current control. Position+speed alone can't tell "stalled
     // against an object" from "stalled against its own end-stop" -- both max
     // out current identically. Below kGripThreshold we track position+speed:
@@ -160,20 +176,49 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
         }
     }
 
-    // Read status
     auto status = stark_get_motor_status(handle, slave_id);
     if (!status) return;
+    publish_status(status, lowstate);
+    free_motor_status_data(status);
+}
+
+// The pose a hand rests in until its first command, and whenever the FSM sends a rest
+// request (an operator ending a teleop session). Position control takes each finger there
+// and PWM 0 then lets it go: a closed hand presses its fingers into each other and into their
+// end stops, so holding the target would draw stall current for as long as the robot sits
+// uncommanded. A stalled finger is released where it stopped, since it can get no closer.
+// `timed_out` releases every finger still held: a finger blocked short of its pose can hold
+// it at its lock current without the firmware ever reporting a stall.
+// A rest on a finger gripping in current mode moves it to a position target, so a finger
+// blocked by the object pushes past kGripCurrent, up to the firmware's limit, until it stalls,
+// and then lets the object go. hive_fsm_ctrl never sends a rest to a hand whose command grips;
+// anyone driving this service or the hand directly has to keep to that too.
+void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id,
+                     unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
+                     std::array<bool, 6>& released, bool timed_out) {
+    // Closed, at the full-grasp caps the teleop controller commands, except thumb_aux: the
+    // closing thumb and index stop it short of that cap and it is not released there, so its
+    // rest sits below where they block it.
+    constexpr uint16_t kRestPose[6] = {980, 300, 980, 980, 980, 980};
+    // A third of full speed: the hand closes at every start, before any command, and may be
+    // closing on the hand of someone mounting or holding it.
+    constexpr uint16_t kRestSpeed = 300;
+    constexpr int kReachedTol = 20;  // normalized position (0-1000)
 
     for (int i = 0; i < 6; ++i) {
-        lowstate->msg_.states()[i].q()        = status->positions[i] / 1000.f;
-        lowstate->msg_.states()[i].dq()       = status->speeds[i] / 1000.f;
-        lowstate->msg_.states()[i].tau_est()  = status->currents[i] / 1000.f;
-
-        // if (status->currents[i] > 800) {
-        //     spdlog::warn("{} finger {} over current: {} mA", ns, i, status->currents[i]);
-        // }
+        if (!released[i]) stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], kRestPose[i], kRestSpeed);
     }
-    lowstate->unlockAndPublish();
+
+    auto status = stark_get_motor_status(handle, slave_id);
+    if (!status) return;
+    for (int i = 0; i < 6; ++i) {
+        bool reached = std::abs(status->positions[i] - kRestPose[i]) <= kReachedTol;
+        if (!released[i] && (reached || timed_out || status->states[i] == MOTOR_STATE_STALL)) {
+            stark_set_finger_pwm(handle, slave_id, kFingerIds[i], 0);
+            released[i] = true;
+        }
+    }
+    publish_status(status, lowstate);
     free_motor_status_data(status);
 }
 
@@ -184,15 +229,34 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
     // DDS setup
     auto lowcmd   = std::make_shared<unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>>("rt/brainco/" + ns + "/cmd");
     lowcmd->msg_.cmds().resize(6);
-    for (auto& finger : lowcmd->msg_.cmds()) finger.dq() = 1.;
 
     auto lowstate = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/state");
     lowstate->msg_.states().resize(6);
 
     std::array<bool, 6> in_current{};
+    std::array<bool, 6> released{};
+    // Latched: once commanded, a stream that goes quiet leaves the hand at its last command,
+    // so a dead FSM or multiplexer never drops what a hand carries.
+    bool commanded = false;
+    bool resting = false;
+    auto rest_since = std::chrono::steady_clock::now();
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
-        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns, in_current);
+        commanded = commanded || !lowcmd->isTimeout();
+        bool rest = !commanded || lowcmd->msg_.cmds()[0].mode() == kRestMode;
+        if (rest != resting) {
+            resting = rest;
+            if (resting) rest_since = std::chrono::steady_clock::now();
+            spdlog::info("{} hand {}", ns, resting ? "closing to rest" : "following commands");
+        }
+        if (rest) {
+            const bool timed_out = std::chrono::steady_clock::now() - rest_since >= kRestReleaseAfter;
+            hold_rest_pose(handle, slave_id, lowstate.get(), released, timed_out);
+            in_current.fill(false);
+        } else {
+            update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), in_current);
+            released.fill(false);
+        }
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
         if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
