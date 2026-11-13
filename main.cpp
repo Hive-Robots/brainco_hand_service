@@ -213,8 +213,9 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
 // Revo2 Touch: one capacitive sensor per fingertip, thumb to pinky, published as five MotorState_
 // entries so every reader that decodes the hand's state decodes these too: q the normal force (N),
 // dq the tangential force (N), ddq its direction (degrees, 0 toward the tip, -1 with none),
-// tau_est the proximity (raw counts), mode the sensor status (its low byte). Revo2 fills only the
-// first of the SDK's three channels per field.
+// tau_est the proximity (raw counts), lost the whole sensor status word, packet counter included
+// (uint32, where mode's byte would cut it). Revo2 fills only the first of the SDK's three
+// channels per field.
 void publish_touch(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* touch,
                    const std::string& ns, int& failures) {
@@ -231,7 +232,7 @@ void publish_touch(DeviceHandler* handle, uint8_t slave_id,
             s.dq()      = f.tangential_force1 / 100.f;
             s.ddq()     = f.tangential_direction1 == 0xFFFF ? -1.f : static_cast<float>(f.tangential_direction1);
             s.tau_est() = static_cast<float>(f.self_proximity1);
-            s.mode()    = static_cast<uint8_t>(f.status & 0xFF);
+            s.lost()    = f.status;
         }
         touch->unlockAndPublish();
     }
@@ -239,8 +240,9 @@ void publish_touch(DeviceHandler* handle, uint8_t slave_id,
 }
 
 // The fingertip sensors' raw channels, as the SDK lays them out: thumb 7, index 11, middle 11,
-// ring 11, pinky 7, one MotorState_ entry each with the value in q. Which channels a Revo2
-// actually fills is for the readings to show.
+// ring 11, pinky 7, one MotorState_ entry each with the count in lost: uint32 like the count,
+// where q's float32 would round counts above 2^24. Which channels a Revo2 actually fills is for
+// the readings to show.
 constexpr int kRawChannels = 47;
 void publish_touch_raw(DeviceHandler* handle, uint8_t slave_id,
                        unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* raw,
@@ -252,11 +254,11 @@ void publish_touch_raw(DeviceHandler* handle, uint8_t slave_id,
     }
     if (raw->trylock()) {
         int k = 0;
-        for (uint32_t v : data->thumb) raw->msg_.states()[k++].q() = static_cast<float>(v);
-        for (uint32_t v : data->index) raw->msg_.states()[k++].q() = static_cast<float>(v);
-        for (uint32_t v : data->middle) raw->msg_.states()[k++].q() = static_cast<float>(v);
-        for (uint32_t v : data->ring) raw->msg_.states()[k++].q() = static_cast<float>(v);
-        for (uint32_t v : data->pinky) raw->msg_.states()[k++].q() = static_cast<float>(v);
+        for (uint32_t v : data->thumb) raw->msg_.states()[k++].lost() = v;
+        for (uint32_t v : data->index) raw->msg_.states()[k++].lost() = v;
+        for (uint32_t v : data->middle) raw->msg_.states()[k++].lost() = v;
+        for (uint32_t v : data->ring) raw->msg_.states()[k++].lost() = v;
+        for (uint32_t v : data->pinky) raw->msg_.states()[k++].lost() = v;
         raw->unlockAndPublish();
     }
     free_touch_raw_data(data);
