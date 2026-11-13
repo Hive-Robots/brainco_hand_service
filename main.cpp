@@ -35,6 +35,12 @@ const StarkFingerId kFingerIds[6] = {
 // the serial line the motor writes and reads share, so it slows the motor loop.
 constexpr int kTouchEvery = 2;
 constexpr uint8_t kAllFingertips = 0x1F;  // thumb, index, middle, ring, pinky
+// The raw channels (47 words) are the costlier read, so less often, on loops the fused
+// reading skips.
+constexpr int kRawEvery = 4;
+// A requested grip current is re-written only when it moved this much: each write dips the
+// finger's current for a few milliseconds.
+constexpr int16_t kCurrentStep = 10;
 
 // ------------------ Utility ------------------
 std::vector<std::string> getAvailableSerialPorts() {
@@ -112,6 +118,7 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 void update_finger(DeviceHandler* handle, uint8_t slave_id,
                    unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
+                   unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* grip,
                    const std::string& ns, std::array<drive::Finger, 6>& fingers) {
     // Per finger, one of three drives, chosen in drive.h. Position+speed alone can't tell
     // "stalled against an object" from "stalled against its own end-stop" -- both max out
@@ -138,11 +145,24 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
 
     for (int i = 0; i < 6; ++i) speeds[i] = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
 
+    // Per finger, the current a grip is held at: the default, unless rt/brainco/<side>/grip_current
+    // (its tau, 1.0 = 1000) has spoken within the last second. Never above the default, so that
+    // topic can only weaken a grip; it bypasses the FSM, which relays q, dq and mode only.
+    int16_t currents[6];
+    const bool steered = !grip->isTimeout() && grip->msg_.cmds().size() == 6;
+    for (int i = 0; i < 6; ++i) {
+        const float asked = steered ? grip->msg_.cmds()[i].tau() : drive::kGripCurrent / 1000.f;
+        currents[i] = static_cast<int16_t>(std::clamp(asked, 0.f, drive::kGripCurrent / 1000.f) * 1000.f);
+    }
+
     std::array<drive::Write, 6> writes;
     bool all_positioned = true;
     for (int i = 0; i < 6; ++i) {
         const bool was_off = fingers[i].off;
         writes[i] = drive::choose(fingers[i], positions[i], modes[i], kFingerIds[i] == STARK_FINGER_ID_THUMB_AUX);
+        if (writes[i] == drive::Write::kNone && fingers[i].in_current &&
+            std::abs(currents[i] - fingers[i].current) >= kCurrentStep)
+            writes[i] = drive::Write::kCurrent;
         if (fingers[i].in_current || fingers[i].off) all_positioned = false;
         if (fingers[i].off != was_off) spdlog::info("{} finger {}: drive {}", ns, i, fingers[i].off ? "off" : "on");
     }
@@ -160,7 +180,8 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
                     stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speeds[i]);
                     break;
                 case drive::Write::kCurrent:
-                    stark_set_finger_current(handle, slave_id, kFingerIds[i], drive::kGripCurrent);
+                    stark_set_finger_current(handle, slave_id, kFingerIds[i], currents[i]);
+                    fingers[i].current = currents[i];
                     break;
                 case drive::Write::kPwmOff:
                     stark_set_finger_pwm(handle, slave_id, kFingerIds[i], 0);
@@ -217,6 +238,30 @@ void publish_touch(DeviceHandler* handle, uint8_t slave_id,
     free_touch_finger_data(data);
 }
 
+// The fingertip sensors' raw channels, as the SDK lays them out: thumb 7, index 11, middle 11,
+// ring 11, pinky 7, one MotorState_ entry each with the value in q. Which channels a Revo2
+// actually fills is for the readings to show.
+constexpr int kRawChannels = 47;
+void publish_touch_raw(DeviceHandler* handle, uint8_t slave_id,
+                       unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* raw,
+                       const std::string& ns, int& failures) {
+    CTouchRawData* data = stark_get_touch_raw_data(handle, slave_id);
+    if (!data) {
+        if (failures++ % 100 == 0) spdlog::warn("{} fingertip raw read failed ({} so far)", ns, failures);
+        return;
+    }
+    if (raw->trylock()) {
+        int k = 0;
+        for (uint32_t v : data->thumb) raw->msg_.states()[k++].q() = static_cast<float>(v);
+        for (uint32_t v : data->index) raw->msg_.states()[k++].q() = static_cast<float>(v);
+        for (uint32_t v : data->middle) raw->msg_.states()[k++].q() = static_cast<float>(v);
+        for (uint32_t v : data->ring) raw->msg_.states()[k++].q() = static_cast<float>(v);
+        for (uint32_t v : data->pinky) raw->msg_.states()[k++].q() = static_cast<float>(v);
+        raw->unlockAndPublish();
+    }
+    free_touch_raw_data(data);
+}
+
 // Worker thread for each hand
 void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns, bool has_touch) {
     spdlog::info("🚀 Starting worker for {} (slave {})", ns, (int)slave_id);
@@ -229,20 +274,27 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns,
     auto lowstate = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/state");
     lowstate->msg_.states().resize(6);
 
-    std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> touch;
+    auto grip = std::make_shared<unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>>("rt/brainco/" + ns + "/grip_current");
+    grip->set_timeout_ms(1000);
+
+    std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> touch, raw;
     if (has_touch) {
         stark_enable_touch_sensor(handle, slave_id, kAllFingertips);
         touch = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/touch");
         touch->msg_.states().resize(5);
-        spdlog::info("{} fingertip sensors on, published every {} loops", ns, kTouchEvery);
+        raw = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/touch_raw");
+        raw->msg_.states().resize(kRawChannels);
+        spdlog::info("{} fingertip sensors on, published every {} loops, raw every {}", ns, kTouchEvery, kRawEvery);
     }
 
     std::array<drive::Finger, 6> fingers{};
-    int loops = 0, touch_failures = 0;
+    int loops = 0, touch_failures = 0, raw_failures = 0;
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
-        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), ns, fingers);
-        if (touch && ++loops % kTouchEvery == 0) publish_touch(handle, slave_id, touch.get(), ns, touch_failures);
+        update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), grip.get(), ns, fingers);
+        ++loops;
+        if (touch && loops % kTouchEvery == 0) publish_touch(handle, slave_id, touch.get(), ns, touch_failures);
+        if (raw && loops % kRawEvery == 1) publish_touch_raw(handle, slave_id, raw.get(), ns, raw_failures);
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
         int sleep_us = 10000 - static_cast<int>(elapsed_us); // 100Hz
         if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));

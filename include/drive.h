@@ -9,7 +9,8 @@ namespace drive {
 // Normalized POSITION (0-1000) at or above which a finger grips at constant current. It sits
 // below real grips: in the pose catalogue every genuine grip is 0.9-0.98.
 constexpr uint16_t kGripThreshold = 800;
-// Normalized current (0-1000) a gripping finger is written once, on entry.
+// Normalized current (0-1000) a gripping finger is written on entry: the default grip, and the
+// ceiling of what rt/brainco/<side>/grip_current may ask.
 constexpr int16_t kGripCurrent = 500;
 // MotorCmd_.mode asking for the finger's drive off (PWM 0): teleop sends it for a finger that
 // has reached its pose's target, and the FSM relays it. 1 is claimed for a whole-hand rest.
@@ -22,6 +23,7 @@ enum class Write { kPosition, kCurrent, kPwmOff, kNone };
 struct Finger {
     bool in_current = false;
     bool off = false;
+    int16_t current = 0;  // the grip current last written, while in_current
 };
 
 // Decide this tick's write for one finger and update its memory. thumb_aux has no mechanical
