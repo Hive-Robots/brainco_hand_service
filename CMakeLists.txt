@@ -50,3 +50,5 @@ link_libraries(
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 add_executable(brainco_hand_server main.cpp)
 add_executable(test_brainco_hand_server test/test_brainco_hand_server.cpp)
+# Replays grips recorded on the robot through grip_guard.h; needs no hand and no DDS.
+add_executable(test_grip_guard test/test_grip_guard.cpp)

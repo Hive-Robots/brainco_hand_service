@@ -1,5 +1,6 @@
 #include "stark-sdk.h"
 #include "param.h"
+#include "grip_guard.h"
 
 #include "dds/Publisher.h"
 #include "dds/Subscription.h"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <cmath>
 #include <atomic>
 #include <filesystem>
 
@@ -35,6 +37,7 @@ const StarkFingerId kFingerIds[6] = {
     STARK_FINGER_ID_THUMB, STARK_FINGER_ID_THUMB_AUX, STARK_FINGER_ID_INDEX,
     STARK_FINGER_ID_MIDDLE, STARK_FINGER_ID_RING, STARK_FINGER_ID_PINKY,
 };
+const char* const kFingerNames[6] = {"thumb", "thumb_aux", "index", "middle", "ring", "pinky"};
 
 // ------------------ Utility ------------------
 std::vector<std::string> getAvailableSerialPorts() {
@@ -109,20 +112,49 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 }
 
 // ------------------ Hand Update Loop ------------------
-void publish_status(const CMotorStatusData* status,
+// One hand's worker state, owned by its worker thread alone.
+struct HandState {
+    std::array<grip::Finger, 6> fingers{};
+    int failed_reads = 0;                   // status reads failed in a row
+    uint64_t rejected_logged = 0;           // malformed commands already reported
+    double rejected_logged_s = -1e9;
+};
+
+double seconds(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double>(t.time_since_epoch()).count();
+}
+
+// Indexing a command with fewer than six motors reads out of bounds, and a NaN reaches the
+// integer cast below. Any process can publish on the command topic, so the subscription stores
+// only commands that pass this.
+bool well_formed(const unitree_go::msg::dds_::MotorCmds_& cmd) {
+    if (cmd.cmds().size() != 6) return false;
+    for (const auto& m : cmd.cmds()) {
+        if (!std::isfinite(m.q()) || !std::isfinite(m.dq())) return false;
+    }
+    return true;
+}
+
+// The publisher thread owns msg_ until trylock() hands it back; skipping one publish beats
+// writing a message it may be copying out.
+void publish_status(const CMotorStatusData* status, const std::array<grip::Finger, 6>& fingers,
                     unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate) {
+    if (!lowstate->trylock()) return;
     for (int i = 0; i < 6; ++i) {
-        lowstate->msg_.states()[i].q()        = status->positions[i] / 1000.f;
-        lowstate->msg_.states()[i].dq()       = status->speeds[i] / 1000.f;
-        lowstate->msg_.states()[i].tau_est()  = status->currents[i] / 1000.f;
+        auto& state = lowstate->msg_.states()[i];
+        state.q()          = status->positions[i] / 1000.f;
+        state.dq()         = status->speeds[i] / 1000.f;
+        state.tau_est()    = status->currents[i] / 1000.f;
+        state.mode()       = static_cast<uint8_t>(fingers[i].state);
+        state.lost()       = fingers[i].resends_total;
+        state.reserve()[0] = status->states[i] + 1u;  // the firmware's MotorState, plus one so that 0 stays "not reported"
     }
     lowstate->unlockAndPublish();
 }
 
-void update_finger(DeviceHandler* handle, uint8_t slave_id,
-                   unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>* lowcmd,
+void update_finger(DeviceHandler* handle, uint8_t slave_id, const unitree_go::msg::dds_::MotorCmds_& cmd, bool fresh,
                    unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
-                   std::array<bool, 6>& in_current) {
+                   const std::string& ns, HandState& hand) {
     // Hybrid position/current control. Position+speed alone can't tell "stalled
     // against an object" from "stalled against its own end-stop" -- both max
     // out current identically. Below kGripThreshold we track position+speed:
@@ -142,11 +174,13 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     // it limp.
     constexpr uint16_t kGripThreshold = 800;  // normalized POSITION (0-1000)
     constexpr int16_t kGripCurrent = 500;    // normalized current (0-1000); tune from testing
+    static_assert(grip::kForce < kGripCurrent, "grip_guard.h confirms a grip by a current above kForce");
 
+    std::array<grip::Finger, 6>& fingers = hand.fingers;
     uint16_t positions[6], speeds[6];
     for (int i = 0; i < 6; ++i) {
-        positions[i] = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].q(), 0.f, 1.f) * 1000.f);
-        speeds[i]    = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].dq(), 0.f, 1.f) * 1000.f);
+        positions[i] = static_cast<uint16_t>(std::clamp(cmd.cmds()[i].q(), 0.f, 1.f) * 1000.f);
+        speeds[i]    = static_cast<uint16_t>(std::clamp(cmd.cmds()[i].dq(), 0.f, 1.f) * 1000.f);
     }
 
     for (int i = 0; i < 6; ++i) speeds[i] = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
@@ -161,24 +195,45 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
         // fingers, so it would knock a gripping finger out of current mode: only when
         // none grips.
         stark_set_finger_positions_and_speeds(handle, slave_id, positions, speeds, 6);
-        in_current.fill(false);
+        for (auto& f : fingers) grip::on_command(f, false);
     } else {
         for (int i = 0; i < 6; ++i) {
             if (positions[i] >= kGripThreshold && kFingerIds[i] != STARK_FINGER_ID_THUMB_AUX) {
-                // Only on entry: each current write dips that finger's current for a few
-                // milliseconds, so rewriting it every tick makes a held grip buzz.
-                if (!in_current[i]) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
-                in_current[i] = true;
+                // Only on entry, and again only to a finger grip_guard.h finds without force:
+                // each current write dips that finger's current for a few milliseconds, so
+                // rewriting it every tick makes a held grip buzz.
+                if (grip::on_command(fingers[i], true)) stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
             } else {
+                grip::on_command(fingers[i], false);
                 stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speeds[i]);
-                in_current[i] = false;
             }
         }
     }
 
+    // Read status. A failed read publishes nothing, so it shows as a gap in the state topic
+    // (as does a publish that publish_status skips).
     auto status = stark_get_motor_status(handle, slave_id);
-    if (!status) return;
-    publish_status(status, lowstate);
+    if (!status) {
+        if (hand.failed_reads++ == 0) spdlog::warn("{} hand: status reads failing", ns);
+        return;
+    }
+    const int failed = hand.failed_reads;
+    hand.failed_reads = 0;
+    if (failed) spdlog::warn("{} hand: status read back after {} failed", ns, failed);
+
+    const double read_at = seconds(std::chrono::steady_clock::now());  // the reading's own time, after the writes
+    for (int i = 0; i < 6; ++i) {
+        const bool gave_up_before = fingers[i].gave_up;
+        const grip::Resend why = grip::on_reading(fingers[i], status->positions[i], status->currents[i], read_at, failed > 0, fresh);
+        if (why != grip::Resend::kNone) {
+            stark_set_finger_current(handle, slave_id, kFingerIds[i], kGripCurrent);
+            spdlog::warn("{} {}: grip current re-sent, no force{} ({} this grip)", ns, kFingerNames[i],
+                         why == grip::Resend::kAfterFailedReads ? " after failed status reads" : "", fingers[i].resends_this_grip);
+        } else if (fingers[i].gave_up && !gave_up_before) {
+            spdlog::error("{} {}: still no force after {} re-sends, leaving it until release", ns, kFingerNames[i], grip::kMaxResends);
+        }
+    }
+    publish_status(status, fingers, lowstate);
     free_motor_status_data(status);
 }
 
@@ -193,7 +248,7 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
 // blocked by the object pushes past kGripCurrent, up to the firmware's limit, until it stalls,
 // and then lets the object go. hive_fsm_ctrl never sends a rest to a hand whose command grips;
 // anyone driving this service or the hand directly has to keep to that too.
-void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id,
+void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id, const std::array<grip::Finger, 6>& fingers,
                      unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>* lowstate,
                      std::array<bool, 6>& released, bool timed_out) {
     // Closed, at the full-grasp caps the teleop controller commands, except thumb_aux: the
@@ -218,7 +273,7 @@ void hold_rest_pose(DeviceHandler* handle, uint8_t slave_id,
             released[i] = true;
         }
     }
-    publish_status(status, lowstate);
+    publish_status(status, fingers, lowstate);
     free_motor_status_data(status);
 }
 
@@ -227,34 +282,47 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns)
     spdlog::info("🚀 Starting worker for {} (slave {})", ns, (int)slave_id);
 
     // DDS setup
-    auto lowcmd   = std::make_shared<unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>>("rt/brainco/" + ns + "/cmd");
-    lowcmd->msg_.cmds().resize(6);
+    unitree_go::msg::dds_::MotorCmds_ none;  // never followed, since the hand rests until a command arrives
+    none.cmds().resize(6);
+    auto lowcmd   = std::make_shared<unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>>("rt/brainco/" + ns + "/cmd", none, well_formed);
 
     auto lowstate = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/state");
     lowstate->msg_.states().resize(6);
 
-    std::array<bool, 6> in_current{};
+    constexpr double kFreshS = 1.0;  // a lost grip is re-sent only while good commands keep coming
+
+    HandState hand;
     std::array<bool, 6> released{};
-    // Latched: once commanded, a stream that goes quiet leaves the hand at its last command,
-    // so a dead FSM or multiplexer never drops what a hand carries.
-    bool commanded = false;
     bool resting = false;
     auto rest_since = std::chrono::steady_clock::now();
     while (running) {
         auto start_time = std::chrono::high_resolution_clock::now();
-        commanded = commanded || !lowcmd->isTimeout();
-        bool rest = !commanded || lowcmd->msg_.cmds()[0].mode() == kRestMode;
+        // One read per loop, so the rest decision and the writes act on the same command.
+        std::chrono::steady_clock::time_point arrived;
+        uint64_t rejected = 0;
+        const auto cmd = lowcmd->latest(&arrived, &rejected);
+        const double now = seconds(std::chrono::steady_clock::now());
+        if (rejected != hand.rejected_logged && now - hand.rejected_logged_s >= 10.0) {
+            spdlog::warn("{} hand: {} malformed commands ignored so far", ns, rejected);
+            hand.rejected_logged = rejected;
+            hand.rejected_logged_s = now;
+        }
+        // Latched: once commanded, a stream that goes quiet leaves the hand at its last command,
+        // so a dead FSM or multiplexer never drops what a hand carries.
+        const bool commanded = arrived != std::chrono::steady_clock::time_point::min();
+        bool rest = !commanded || cmd.cmds()[0].mode() == kRestMode;
         if (rest != resting) {
             resting = rest;
             if (resting) rest_since = std::chrono::steady_clock::now();
             spdlog::info("{} hand {}", ns, resting ? "closing to rest" : "following commands");
         }
         if (rest) {
+            for (auto& f : hand.fingers) grip::on_command(f, false);  // a rest ends every grip, as a release does
+            hand.failed_reads = 0;  // reads that failed before the rest must not skip the wait after it
             const bool timed_out = std::chrono::steady_clock::now() - rest_since >= kRestReleaseAfter;
-            hold_rest_pose(handle, slave_id, lowstate.get(), released, timed_out);
-            in_current.fill(false);
+            hold_rest_pose(handle, slave_id, hand.fingers, lowstate.get(), released, timed_out);
         } else {
-            update_finger(handle, slave_id, lowcmd.get(), lowstate.get(), in_current);
+            update_finger(handle, slave_id, cmd, now - seconds(arrived) <= kFreshS, lowstate.get(), ns, hand);
             released.fill(false);
         }
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
