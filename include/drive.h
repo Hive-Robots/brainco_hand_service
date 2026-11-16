@@ -2,6 +2,7 @@
 // Pure, so it can be tested without a hand: main.cpp turns the answer into SDK calls.
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace drive {
@@ -9,9 +10,11 @@ namespace drive {
 // Normalized POSITION (0-1000) at or above which a finger grips at constant current. It sits
 // below real grips: in the pose catalogue every genuine grip is 0.9-0.98.
 constexpr uint16_t kGripThreshold = 800;
-// Normalized current (0-1000) a gripping finger is written on entry: the default grip, and the
-// ceiling of what rt/brainco/<side>/grip_current may ask.
-constexpr int16_t kGripCurrent = 500;
+// Normalized current (0-1000) a gripping finger is written on entry, per motor (thumb, thumb_aux,
+// index, middle, ring, pinky): the default grip, and the ceiling of what
+// rt/brainco/<side>/grip_current may ask. Thumb and index carry the catheter pinch (tip-squeeze),
+// so they press harder than the default 500; thumb_aux never squeezes.
+constexpr std::array<int16_t, 6> kGripCurrent{750, 500, 750, 500, 500, 500};
 // MotorCmd_.mode asking for the finger's drive off (PWM 0): teleop sends it for a finger that
 // has reached its pose's target, and the FSM relays it. 1 is claimed for a whole-hand rest.
 constexpr uint8_t kOffMode = 2;

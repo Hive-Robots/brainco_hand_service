@@ -150,8 +150,9 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     int16_t currents[6];
     const bool steered = !grip->isTimeout() && grip->msg_.cmds().size() == 6;
     for (int i = 0; i < 6; ++i) {
-        const float asked = steered ? grip->msg_.cmds()[i].tau() : drive::kGripCurrent / 1000.f;
-        currents[i] = static_cast<int16_t>(std::clamp(asked, 0.f, drive::kGripCurrent / 1000.f) * 1000.f);
+        const float ceiling = drive::kGripCurrent[i] / 1000.f;
+        const float asked = steered ? grip->msg_.cmds()[i].tau() : ceiling;
+        currents[i] = static_cast<int16_t>(std::clamp(asked, 0.f, ceiling) * 1000.f);
     }
 
     std::array<drive::Write, 6> writes;
