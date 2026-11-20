@@ -285,6 +285,28 @@ void publish_touch(DeviceHandler* handle, uint8_t slave_id,
     free_touch_finger_data(data);
 }
 
+// Clears a fingertip's stuck raw value (status bit 1) with the reset and its idle force offset
+// (bit 2, its force frozen until calibrated) with the calibration. Both zero against whatever
+// touches the fingertips now, so nothing may; readings are invalid for kTouchSettle after.
+void zero_fingertips(DeviceHandler* handle, uint8_t slave_id) {
+    stark_reset_touch_sensor(handle, slave_id, kAllFingertips);
+    stark_calibrate_touch_sensor(handle, slave_id, kAllFingertips);
+}
+
+// A topic each message of which is one request, whatever it carries.
+class Requests : public unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_> {
+public:
+    using unitree::robot::SubscriptionBase<unitree_go::msg::dds_::MotorCmds_>::SubscriptionBase;
+    // Whether one came since the last call.
+    bool take() { return pending_.exchange(false); }
+
+protected:
+    void post_communication() override { pending_ = true; }
+
+private:
+    std::atomic<bool> pending_{false};
+};
+
 // Worker thread for each hand
 void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns, bool has_touch) {
     spdlog::info("🚀 Starting worker for {} (slave {})", ns, (int)slave_id);
@@ -303,16 +325,17 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns,
     // No raw channels: the SDK's raw read assumes Revo1's layout, and on a Revo2 its Rust code
     // panics, which aborts this whole process.
     std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> touch;
+    // rt/brainco/<side>/touch_calibrate: zero the fingertips again, as at start, whenever asked.
+    // The sender holds the hand open and clear of everything first; the hand itself is not moved.
+    std::unique_ptr<Requests> calibrate;
     auto touch_from = std::chrono::steady_clock::now();
     if (has_touch) {
         stark_enable_touch_sensor(handle, slave_id, kAllFingertips);
-        // Enabled alone, a fingertip can come up flagged and never move: a raw value stuck
-        // (status bit 1, cleared by a reset) or an idle force offset held past 10 s (bit 2, its
-        // force frozen until calibrated). Both zero against an unloaded fingertip, so the
-        // service must start with nothing touching them.
-        stark_reset_touch_sensor(handle, slave_id, kAllFingertips);
-        stark_calibrate_touch_sensor(handle, slave_id, kAllFingertips);
+        // Enabled alone, a fingertip can come up flagged and never move. The service must start
+        // with nothing touching them.
+        zero_fingertips(handle, slave_id);
         touch_from += kTouchSettle;
+        calibrate = std::make_unique<Requests>("rt/brainco/" + ns + "/touch_calibrate");
         touch = std::make_unique<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>>("rt/brainco/" + ns + "/touch");
         touch->msg_.states().resize(5);
         spdlog::info("{} fingertip sensors on, reset and calibrated, published every {} loops", ns, kTouchEvery);
@@ -346,6 +369,11 @@ void hand_worker(DeviceHandler* handle, uint8_t slave_id, const std::string& ns,
             released.fill(false);
         }
         ++loops;
+        if (calibrate && calibrate->take()) {
+            zero_fingertips(handle, slave_id);
+            touch_from = std::chrono::steady_clock::now() + kTouchSettle;
+            spdlog::info("{} fingertip sensors reset and calibrated on request", ns);
+        }
         if (touch && loops % kTouchEvery == 0 && std::chrono::steady_clock::now() >= touch_from)
             publish_touch(handle, slave_id, touch.get(), ns, touch_failures);
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start_time).count();
