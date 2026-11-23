@@ -53,6 +53,19 @@ int main() {
     CHECK(drive::choose(odd, 300, 7, false) == Write::kPosition);
     CHECK(drive::choose(odd, 980, 7, false) == Write::kCurrent);
 
+    // A held grip is rewritten only when its commanded current changes.
+    Finger grip;
+    CHECK(drive::choose(grip, 980, 0, false, 300) == Write::kCurrent);
+    CHECK(grip.current == 300);
+    CHECK(drive::choose(grip, 980, 0, false, 300) == Write::kNone);
+    CHECK(drive::choose(grip, 980, 0, false, 700) == Write::kCurrent);
+    CHECK(grip.current == 700);
+
+    // tau carries the current as a fraction of 1000; none (0) means the default.
+    CHECK(drive::grip_current(0.f) == drive::kGripCurrent);
+    CHECK(drive::grip_current(0.3f) == 300);
+    CHECK(drive::grip_current(2.f) == 1000);
+
     std::puts("test_drive: ok");
     return 0;
 }

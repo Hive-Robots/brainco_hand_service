@@ -114,21 +114,23 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     // safe open/approach *and* positioning motion. At/above it (a firm close/grip command)
     // it switches to direct current control instead: current mode is inherently compliant,
     // so the finger closes until it meets real resistance (object or hard-stop) and holds
-    // there at exactly the commanded current, rather than slamming a position target and
-    // letting the servo's stall behavior decide the force. Per-finger, not a whole-hand mode
-    // switch, so a partial grip (e.g. index held open while the rest close) still works in
-    // one tick. A finger whose command says it has arrived (mode kOffMode) has its drive
-    // switched off: PWM 0 draws nothing and the gear train holds it. thumb_aux never takes
-    // current mode and is never switched off, whatever its command: it swings the thumb
-    // sideways with nothing to press against, so current mode drives it into its end stop,
-    // where the firmware cuts its current and leaves it limp, and without power it has no
-    // hold at all.
+    // there at the current its command's tau asks for (kGripCurrent when it carries none),
+    // rather than slamming a position target and letting the servo's stall behavior decide
+    // the force. Per-finger, not a whole-hand mode switch, so a partial grip (e.g. index held
+    // open while the rest close) still works in one tick. A finger whose command says it has
+    // arrived (mode kOffMode) has its drive switched off: PWM 0 draws nothing and the gear
+    // train holds it. thumb_aux never takes current mode and is never switched off, whatever
+    // its command: it swings the thumb sideways with nothing to press against, so current
+    // mode drives it into its end stop, where the firmware cuts its current and leaves it
+    // limp, and without power it has no hold at all.
     uint16_t positions[6], speeds[6];
     uint8_t modes[6];
+    int16_t currents[6];
     for (int i = 0; i < 6; ++i) {
         positions[i] = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].q(), 0.f, 1.f) * 1000.f);
         speeds[i]    = static_cast<uint16_t>(std::clamp(lowcmd->msg_.cmds()[i].dq(), 0.f, 1.f) * 1000.f);
         modes[i]     = lowcmd->msg_.cmds()[i].mode();
+        currents[i]  = drive::grip_current(lowcmd->msg_.cmds()[i].tau());
     }
 
     for (int i = 0; i < 6; ++i) speeds[i] = std::max<uint16_t>(speeds[i], 1);  // API requires speed >= 1
@@ -137,7 +139,7 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
     bool all_positioned = true;
     for (int i = 0; i < 6; ++i) {
         const bool was_off = fingers[i].off;
-        writes[i] = drive::choose(fingers[i], positions[i], modes[i], kFingerIds[i] == STARK_FINGER_ID_THUMB_AUX);
+        writes[i] = drive::choose(fingers[i], positions[i], modes[i], kFingerIds[i] == STARK_FINGER_ID_THUMB_AUX, currents[i]);
         if (fingers[i].in_current || fingers[i].off) all_positioned = false;
         if (fingers[i].off != was_off) spdlog::info("{} finger {}: drive {}", ns, i, fingers[i].off ? "off" : "on");
     }
@@ -155,7 +157,7 @@ void update_finger(DeviceHandler* handle, uint8_t slave_id,
                     stark_set_finger_position_with_speed(handle, slave_id, kFingerIds[i], positions[i], speeds[i]);
                     break;
                 case drive::Write::kCurrent:
-                    stark_set_finger_current(handle, slave_id, kFingerIds[i], drive::kGripCurrent);
+                    stark_set_finger_current(handle, slave_id, kFingerIds[i], fingers[i].current);
                     break;
                 case drive::Write::kPwmOff:
                     stark_set_finger_pwm(handle, slave_id, kFingerIds[i], 0);

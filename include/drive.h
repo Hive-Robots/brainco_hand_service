@@ -2,6 +2,8 @@
 // Pure, so it can be tested without a hand: main.cpp turns the answer into SDK calls.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace drive {
@@ -9,7 +11,7 @@ namespace drive {
 // Normalized POSITION (0-1000) at or above which a finger grips at constant current. It sits
 // below real grips: in the pose catalogue every genuine grip is 0.9-0.98.
 constexpr uint16_t kGripThreshold = 800;
-// Normalized current (0-1000) a gripping finger is written once, on entry.
+// Normalized current (0-1000) a gripping finger is written when its command carries none.
 constexpr int16_t kGripCurrent = 500;
 // MotorCmd_.mode asking for the finger's drive off (PWM 0): teleop sends it for a finger that
 // has reached its pose's target, and the FSM relays it. 1 is claimed for a whole-hand rest.
@@ -22,11 +24,19 @@ enum class Write { kPosition, kCurrent, kPwmOff, kNone };
 struct Finger {
     bool in_current = false;
     bool off = false;
+    int16_t current = 0;  // the grip current last written, while in_current
 };
+
+// A finger's grip current from its command's tau, the fraction of 1000 that teleop sends per
+// pose. 0, what a publisher that sets no tau sends, and anything not finite mean kGripCurrent.
+inline int16_t grip_current(float tau) {
+    if (!std::isfinite(tau) || tau <= 0.f) return kGripCurrent;
+    return static_cast<int16_t>(std::max(1.f, std::min(tau, 1.f) * 1000.f));
+}
 
 // Decide this tick's write for one finger and update its memory. thumb_aux has no mechanical
 // hold and nothing to press against, so it is positioned whatever its command says.
-inline Write choose(Finger& f, uint16_t position, uint8_t mode, bool thumb_aux) {
+inline Write choose(Finger& f, uint16_t position, uint8_t mode, bool thumb_aux, int16_t current = kGripCurrent) {
     if (mode == kOffMode && !thumb_aux) {
         // Once: PWM 0 draws nothing and the gear train holds the finger where it is.
         const bool enter = !f.off;
@@ -36,11 +46,12 @@ inline Write choose(Finger& f, uint16_t position, uint8_t mode, bool thumb_aux) 
     }
     f.off = false;
     if (position >= kGripThreshold && !thumb_aux) {
-        // Only on entry: each current write dips that finger's current for a few
-        // milliseconds, so rewriting it every tick makes a held grip buzz.
-        const bool enter = !f.in_current;
+        // Only on entry or a new current: each current write dips that finger's current for a
+        // few milliseconds, so rewriting it every tick makes a held grip buzz.
+        const bool write = !f.in_current || current != f.current;
         f.in_current = true;
-        return enter ? Write::kCurrent : Write::kNone;
+        f.current = current;
+        return write ? Write::kCurrent : Write::kNone;
     }
     f.in_current = false;
     return Write::kPosition;
