@@ -12,9 +12,9 @@ namespace drive {
 constexpr uint16_t kGripThreshold = 800;
 // Normalized current (0-1000) a gripping finger is written on entry, per motor (thumb, thumb_aux,
 // index, middle, ring, pinky): the default grip, and the ceiling of what
-// rt/brainco/<side>/grip_current may ask. Thumb and index carry the catheter pinch (tip-squeeze),
-// so they press harder than the default 500; thumb_aux never squeezes.
-constexpr std::array<int16_t, 6> kGripCurrent{750, 500, 750, 500, 500, 500};
+// rt/brainco/<side>/grip_current may ask. 500 for every finger, main's single value; per motor so
+// that topic can lower one finger alone. thumb_aux never squeezes.
+constexpr std::array<int16_t, 6> kGripCurrent{500, 500, 500, 500, 500, 500};
 // MotorCmd_.mode asking for the finger's drive off (PWM 0): teleop sends it for a finger that
 // has reached its pose's target, and the FSM relays it. 1 is claimed for a whole-hand rest.
 constexpr uint8_t kOffMode = 2;
