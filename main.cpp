@@ -104,9 +104,12 @@ HandConnection find_hand(std::vector<std::string>& ports, uint8_t slave_id, cons
 
         if (std::find(allowed_skus.begin(), allowed_skus.end(), conn.info->sku_type) != allowed_skus.end()) {
             spdlog::info("{} hand bound to {} port", hand_name, port);
-            // Start from the default: a value an earlier run raised may still be set.
+            // Start from the default: a value an earlier run raised may still be set. Read
+            // before the write too, since the value a hand holds on its own is not known.
+            const uint16_t found = stark_get_thumb_aux_lock_current(conn.handle, slave_id);
             stark_set_thumb_aux_lock_current(conn.handle, slave_id, kThumbAuxLockCurrentRest);
-            spdlog::info("{} thumb_aux lock current: {} mA", hand_name,
+            spdlog::info("{} thumb_aux lock current: found {} mA, set {} mA, reads back {} mA",
+                         hand_name, found, kThumbAuxLockCurrentRest,
                          stark_get_thumb_aux_lock_current(conn.handle, slave_id));
             ports.erase(std::remove(ports.begin(), ports.end(), port), ports.end());
             return conn;
